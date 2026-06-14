@@ -1,0 +1,11 @@
+torch>=2.2.0
+transformers>=4.45,<5
+accelerate>=0.30
+peft>=0.11
+bitsandbytes>=0.43; platform_system == "Linux"
+librosa>=0.10
+soundfile>=0.12
+PyYAML>=6
+numpy>=1.24
+scipy>=1.10
+tqdm>=4.66

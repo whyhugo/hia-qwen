@@ -1,0 +1,33 @@
+seed: 17
+
+data:
+  task: multi_all
+  test_jsonl: /datas/store163/whyhugo/ms-qwen2-reproduce/data/processed/so762/test_multi_all.jsonl
+  seq_data_dir: /datas/store163/whyhugo/apa-hia-framework/data/seq_data_librispeech
+  raw_data_root: /datas/store163/whyhugo/datasets/speechocean762
+
+hia:
+  repo: /datas/store163/whyhugo/apa-hia-framework
+  checkpoint: /datas/store163/whyhugo/apa-hia-framework/exp/hia_seed17/models/best_audio_model.pth
+  embed_dim: 48
+  num_heads: 1
+  depth: 3
+  dropout: 0.1
+  seq_len: 50
+
+qwen:
+  base_model: Qwen/Qwen2-Audio-7B-Instruct
+  local_files_only: true
+  torch_dtype: bfloat16
+  device_map: auto
+  quantization: 4bit
+  projector_hidden_dim:
+  projector_dropout: 0.0
+
+eval:
+  checkpoint: outputs/joint_lora_stage2
+  out_dir: outputs/joint_lora_stage2/eval_test
+  max_records:
+  batch_size: 1
+  num_workers: 0
+  max_new_tokens: 1536
