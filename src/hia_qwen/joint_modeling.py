@@ -256,6 +256,133 @@ class HiaQwenJointModel(nn.Module):
             )
         return torch.cat(generated, dim=1)
 
+    # ------------------------------------------------------------------
+    # Batched generation (left-padded) — large speedup over batch_size=1.
+    #
+    # The batch_size=1 path above right-pads and reads logits[:, -1], which is
+    # only correct when there is no padding. For batched decoding we LEFT-pad so
+    # every row's real last token sits at column -1, and pass explicit
+    # position_ids so RoPE positions ignore the left padding.
+    # ------------------------------------------------------------------
+    def _build_left_padded_generation_inputs(
+        self,
+        prompts: Sequence[str],
+        hia_features: HiaFeatureOutput,
+    ) -> Dict[str, torch.Tensor]:
+        device = next(self.projectors.parameters()).device
+        tokenized = tokenize_prompts(self.tokenizer, prompts)
+        input_ids = tokenized["input_ids"].to(device)
+        attention_mask = tokenized["attention_mask"].to(device)
+        embeds = _get_text_embedding_layer(self.llm)(input_ids)
+        projected = self.projected_features(hia_features, device)
+        id_to_name = {
+            self.special_token_ids[HIA_UTT_TOKEN]: "utt",
+            self.special_token_ids[HIA_WORD_TOKEN]: "word",
+            self.special_token_ids[HIA_PHONE_TOKEN]: "phone",
+        }
+        rows: List[torch.Tensor] = []
+        for r in range(input_ids.shape[0]):
+            pieces: List[torch.Tensor] = []
+            # Iterate real (non-pad) columns in order, robust to either pad side.
+            for c in attention_mask[r].nonzero(as_tuple=True)[0].tolist():
+                token_id = int(input_ids[r, c].item())
+                name = id_to_name.get(token_id)
+                if name is None:
+                    pieces.append(embeds[r, c : c + 1])
+                else:
+                    pieces.append(projected[name][r].to(device=device, dtype=embeds.dtype))
+            rows.append(torch.cat(pieces, dim=0))
+        max_len = max(x.shape[0] for x in rows)
+        batch = len(rows)
+        hidden = embeds.shape[-1]
+        final_embeds = embeds.new_zeros((batch, max_len, hidden))
+        final_attention = torch.zeros((batch, max_len), dtype=torch.long, device=device)
+        for r, seq in enumerate(rows):
+            length = seq.shape[0]
+            final_embeds[r, max_len - length :] = seq  # LEFT pad
+            final_attention[r, max_len - length :] = 1
+        position_ids = final_attention.cumsum(dim=-1) - 1
+        position_ids.masked_fill_(final_attention == 0, 0)
+        return {
+            "inputs_embeds": final_embeds,
+            "attention_mask": final_attention,
+            "position_ids": position_ids,
+        }
+
+    @torch.no_grad()
+    def greedy_decode_batched(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        max_new_tokens: int,
+    ) -> torch.Tensor:
+        if max_new_tokens <= 0:
+            return torch.empty((inputs_embeds.shape[0], 0), dtype=torch.long, device=inputs_embeds.device)
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        outputs = self.llm(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=True,
+            return_dict=True,
+        )
+        past_key_values = getattr(outputs, "past_key_values", None)
+        next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        generated = [next_token]
+        finished = torch.zeros(next_token.shape[0], dtype=torch.bool, device=next_token.device)
+        if eos_token_id is not None:
+            finished |= next_token.squeeze(1).eq(int(eos_token_id))
+        running_attention = torch.cat(
+            [attention_mask, attention_mask.new_ones((attention_mask.shape[0], 1))], dim=1
+        )
+        cur_pos = position_ids[:, -1:].clone()  # each row's last real position
+        for _ in range(max_new_tokens - 1):
+            if bool(finished.all()):
+                break
+            cur_pos = cur_pos + 1
+            outputs = self.llm(
+                input_ids=next_token,
+                attention_mask=running_attention,
+                position_ids=cur_pos,
+                past_key_values=past_key_values,
+                use_cache=True,
+                return_dict=True,
+            )
+            past_key_values = getattr(outputs, "past_key_values", None)
+            next_token = outputs.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            if eos_token_id is not None:
+                next_token = torch.where(
+                    finished.unsqueeze(1),
+                    torch.full_like(next_token, int(eos_token_id)),
+                    next_token,
+                )
+                finished |= next_token.squeeze(1).eq(int(eos_token_id))
+            generated.append(next_token)
+            running_attention = torch.cat(
+                [running_attention, running_attention.new_ones((running_attention.shape[0], 1))], dim=1
+            )
+        return torch.cat(generated, dim=1)
+
+    def generate_json_batched(
+        self,
+        prompts: Sequence[str],
+        hia_features: HiaFeatureOutput,
+        max_new_tokens: int = 768,
+    ) -> List[str]:
+        merged = self._build_left_padded_generation_inputs(prompts, hia_features)
+        generated_ids = self.greedy_decode_batched(
+            inputs_embeds=merged["inputs_embeds"],
+            attention_mask=merged["attention_mask"],
+            position_ids=merged["position_ids"],
+            max_new_tokens=max_new_tokens,
+        )
+        return self.tokenizer.batch_decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
     def save_projectors(self, output_dir: str | Path) -> None:
         output = Path(output_dir)
         output.mkdir(parents=True, exist_ok=True)

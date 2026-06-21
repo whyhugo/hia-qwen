@@ -115,19 +115,44 @@ def generate_predictions(cfg: Dict[str, Any], dataset: Stage2JsonDataset, max_ne
     model.llm = PeftModel.from_pretrained(model.llm, str(checkpoint))
     model.projectors.to(device)
     model.eval()
+    batch_size = int(eval_cfg.get("batch_size", 1))
     loader = DataLoader(
         dataset,
-        batch_size=int(eval_cfg.get("batch_size", 1)),
+        batch_size=batch_size,
         shuffle=False,
         num_workers=int(eval_cfg.get("num_workers", 0)),
         collate_fn=collate_stage2_batch,
     )
+    total = len(dataset)
     predictions: List[Dict[str, str]] = []
+    checked = batch_size <= 1  # only need the padding self-check when batching
     for batch in loader:
         features = hia(batch.gop.to(device), batch.phn_id.to(device), batch.word_id.to(device))
-        outputs = model.generate_json(batch.prompts, features, max_new_tokens=max_new_tokens)
+        # Correctness gate: on the first multi-row batch, verify that the
+        # left-padded batched decode matches a per-row (no-padding) decode.
+        # Aborts rather than silently emitting wrong scores.
+        if not checked:
+            k = min(4, len(batch.ids))
+            batched_k = model.generate_json_batched(batch.prompts[:k], features, max_new_tokens=max_new_tokens)
+            for i in range(k):
+                fi = hia(
+                    batch.gop[i : i + 1].to(device),
+                    batch.phn_id[i : i + 1].to(device),
+                    batch.word_id[i : i + 1].to(device),
+                )
+                ref = model.generate_json_batched([batch.prompts[i]], fi, max_new_tokens=max_new_tokens)[0]
+                if ref.strip() != batched_k[i].strip():
+                    raise SystemExit(
+                        "Batched-generation self-check FAILED (padding bug). Re-run with "
+                        f"eval.batch_size=1.\n--- single ---\n{ref}\n--- batched ---\n{batched_k[i]}"
+                    )
+            print(f"[eval] batched self-check passed on {k} records (batch_size={batch_size})")
+            checked = True
+        outputs = model.generate_json_batched(batch.prompts, features, max_new_tokens=max_new_tokens)
         for utt_id, output in zip(batch.ids, outputs):
             predictions.append({"id": utt_id, "prediction": output.strip()})
+        if len(predictions) % 200 < batch_size:
+            print(f"[eval] {len(predictions)}/{total} records generated", flush=True)
     return predictions
 
 
