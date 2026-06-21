@@ -30,6 +30,10 @@ class Stage2Batch:
     phn_id: torch.Tensor
     word_id: torch.Tensor
     records: List[Dict[str, Any]]
+    # Aligned gold scores for the auxiliary regression heads (variable length per
+    # row): phone accuracy in flattened word order, word [accuracy, stress, total].
+    phone_targets: List[torch.Tensor]
+    word_targets: List[torch.Tensor]
 
 
 def build_stage2_prompt(record: Dict[str, Any], use_hia: bool = True) -> str:
@@ -110,6 +114,9 @@ class Stage2JsonDataset(Dataset):
         gop = normalize_gop(np.asarray(self.feat[row]))
         phn_id = np.asarray(self.label_phn[row, :, 0]).copy()
         word_id = np.asarray(self.label_word[row, :, 3]).copy()
+        words = record["labels"]["words"]
+        phone_acc = [a for word in words for a in word["phones_accuracy"]]
+        word_scores = [[word["accuracy"], word["stress"], word["total"]] for word in words]
         return {
             "id": record["id"],
             "prompt": build_stage2_prompt(record, use_hia=self.use_hia),
@@ -117,6 +124,8 @@ class Stage2JsonDataset(Dataset):
             "gop": torch.from_numpy(gop).float(),
             "phn_id": torch.from_numpy(phn_id).long(),
             "word_id": torch.from_numpy(word_id).long(),
+            "phone_targets": torch.tensor(phone_acc, dtype=torch.float32),
+            "word_targets": torch.tensor(word_scores, dtype=torch.float32).reshape(-1, 3),
             "record": record,
         }
 
@@ -130,4 +139,6 @@ def collate_stage2_batch(samples: Sequence[Dict[str, Any]]) -> Stage2Batch:
         phn_id=torch.stack([sample["phn_id"] for sample in samples], dim=0),
         word_id=torch.stack([sample["word_id"] for sample in samples], dim=0),
         records=[sample["record"] for sample in samples],
+        phone_targets=[sample["phone_targets"] for sample in samples],
+        word_targets=[sample["word_targets"] for sample in samples],
     )

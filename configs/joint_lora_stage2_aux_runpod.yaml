@@ -1,0 +1,54 @@
+seed: 17
+output_dir: outputs/joint_lora_stage2_aux
+max_train_records:
+min_free_vram_gb: 22
+
+data:
+  task: multi_all
+  train_jsonl: external/so762/train_multi_all.jsonl
+  seq_data_dir: external/seq_data_librispeech
+  raw_data_root: external/speechocean762
+
+hia:
+  repo: external/apa-hia-framework
+  checkpoint: external/hia_ckpt/best_audio_model.pth
+  embed_dim: 48
+  num_heads: 1
+  depth: 3
+  dropout: 0.1
+  seq_len: 50
+
+qwen:
+  base_model: Qwen/Qwen2-Audio-7B-Instruct
+  local_files_only: false
+  torch_dtype: bfloat16
+  device_map: auto
+  quantization: 4bit
+  projector_hidden_dim:
+  projector_dropout: 0.0
+  # Start from the multi-granularity Stage-1 projector already on the volume, so
+  # the only change vs joint_lora_stage2_multi is the auxiliary regression heads.
+  projector_checkpoint: outputs/alignment_stage1_multi/projector.pt
+
+lora:
+  rank: 8
+  alpha: 16
+  dropout: 0.05
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+
+train:
+  num_epochs: 6
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  num_workers: 0
+  # Auxiliary phone/word regression on the projected soft tokens (targets
+  # normalized to [0,1]). 0 disables. Tunable — raise if phone/word stays flat,
+  # lower if JSON validity/sentence scores degrade.
+  aux_phone_weight: 1.0
+  aux_word_weight: 1.0

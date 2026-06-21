@@ -1,0 +1,34 @@
+seed: 17
+
+data:
+  task: multi_all
+  test_jsonl: external/so762/test_multi_all.jsonl
+  seq_data_dir: external/seq_data_librispeech
+  raw_data_root: external/speechocean762
+
+hia:
+  repo: external/apa-hia-framework
+  checkpoint: external/hia_ckpt/best_audio_model.pth
+  embed_dim: 48
+  num_heads: 1
+  depth: 3
+  dropout: 0.1
+  seq_len: 50
+
+qwen:
+  base_model: Qwen/Qwen2-Audio-7B-Instruct
+  local_files_only: false
+  torch_dtype: bfloat16
+  device_map: auto
+  quantization: 4bit
+  projector_hidden_dim:
+  projector_dropout: 0.0
+
+eval:
+  checkpoint: outputs/joint_lora_stage2_aux
+  out_dir: outputs/joint_lora_stage2_aux/eval_test
+  max_records:
+  # Batched + length-bucketed (same fast path as eval_stage2_runpod_fast).
+  batch_size: 24
+  max_new_tokens: 1536
+  num_workers: 0

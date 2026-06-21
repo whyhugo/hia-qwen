@@ -273,6 +273,15 @@ def main() -> None:
         prepare_kbit=qwen_cfg.get("quantization") == "4bit",
     )
     model.projectors.to(device)
+    model.phone_reg_head.to(device)
+    model.word_reg_head.to(device)
+
+    # Auxiliary phone/word regression weights (0 = disabled, plain LM training).
+    aux_phone_weight = float(train_cfg.get("aux_phone_weight", 0.0))
+    aux_word_weight = float(train_cfg.get("aux_word_weight", 0.0))
+    aux_enabled = aux_phone_weight > 0.0 or aux_word_weight > 0.0
+    if aux_enabled:
+        print(f"[aux] multi-task regression on: phone_w={aux_phone_weight} word_w={aux_word_weight}")
 
     # -----------------------------------------------------------------------
     # Resume from checkpoint (must happen after configure_lora)
@@ -341,8 +350,22 @@ def main() -> None:
 
         for batch in dataloader:
             features = hia(batch.gop.to(device), batch.phn_id.to(device), batch.word_id.to(device))
-            outputs = model(batch.prompts, batch.targets, features)
-            loss = outputs.loss
+            aux_log = {}
+            if aux_enabled:
+                mt = model.forward_multitask(
+                    batch.prompts, batch.targets, features,
+                    batch.phone_targets, batch.word_targets,
+                    aux_phone_weight=aux_phone_weight, aux_word_weight=aux_word_weight,
+                )
+                loss = mt["loss"]
+                aux_log = {
+                    "lm_loss": float(mt["lm_loss"].detach().cpu()),
+                    "phone_mse": float(mt["phone_mse"].detach().cpu()),
+                    "word_mse": float(mt["word_mse"].detach().cpu()),
+                }
+            else:
+                outputs = model(batch.prompts, batch.targets, features)
+                loss = outputs.loss
             (loss / grad_accum).backward()
             bad_grads = [name for name in gradient_parameter_names(model) if not is_stage2_trainable_name(name)]
             if bad_grads:
@@ -362,6 +385,7 @@ def main() -> None:
                 "epoch": epoch + 1,
                 "step": global_step,
                 "loss": loss_val,
+                **aux_log,
                 "phone_lengths": features.phone_lengths,
                 "word_lengths": features.word_lengths,
                 "raw_word_branch_shape": list(features.raw_word_branch.shape),
@@ -370,6 +394,8 @@ def main() -> None:
 
             if writer is not None:
                 writer.add_scalar("train/loss", loss_val, global_step)
+                for key, val in aux_log.items():
+                    writer.add_scalar(f"train/{key}", val, global_step)
 
             if train_log_f is not None:
                 train_log_f.write(json.dumps(log_record) + "\n")

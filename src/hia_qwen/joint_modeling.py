@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Sequence
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .data import HIA_PHONE_TOKEN, HIA_SPECIAL_TOKENS, HIA_UTT_TOKEN, HIA_WORD_TOKEN
 from .hia_features import HiaFeatureOutput
@@ -23,7 +24,13 @@ from .modeling import (
 
 def is_stage2_trainable_name(name: str) -> bool:
     lowered = name.lower()
-    return name.startswith("projectors.") or "lora_" in lowered or ".modules_to_save." in lowered
+    return (
+        name.startswith("projectors.")
+        or name.startswith("phone_reg_head.")
+        or name.startswith("word_reg_head.")
+        or "lora_" in lowered
+        or ".modules_to_save." in lowered
+    )
 
 
 def tokenize_prompts(tokenizer: Any, prompts: Sequence[str]) -> Dict[str, torch.Tensor]:
@@ -54,6 +61,13 @@ class HiaQwenJointModel(nn.Module):
                 dropout=projector_dropout,
             )
         )
+        # Auxiliary regression heads on the projected soft tokens. They pressure
+        # the projector to keep phone/word score info linearly decodable from the
+        # tokens Qwen sees (HIA's own 48->1 head reaches phone PCC 0.657 from the
+        # same features), countering the fusion loss where scores only flow
+        # through the LM. Used only at train time; eval ignores them.
+        self.phone_reg_head = nn.Linear(llm_dim, 1)
+        self.word_reg_head = nn.Linear(llm_dim, 3)  # accuracy, stress, total
         self.special_token_ids = {token: _single_token_id(tokenizer, token) for token in HIA_SPECIAL_TOKENS}
         for param in self.llm.parameters():
             param.requires_grad_(False)
@@ -137,6 +151,11 @@ class HiaQwenJointModel(nn.Module):
         state = torch.load(path, map_location="cpu")
         projectors = state.get("projectors", state)
         self.projectors.load_state_dict(projectors, strict=strict)
+        # Aux heads only exist in Stage-2 checkpoints; Stage-1 projector.pt omits
+        # them (they stay randomly initialized, which is correct for a fresh run).
+        if isinstance(state, dict) and "phone_reg_head" in state:
+            self.phone_reg_head.load_state_dict(state["phone_reg_head"])
+            self.word_reg_head.load_state_dict(state["word_reg_head"])
 
     def projected_features(self, hia_features: HiaFeatureOutput, device: torch.device) -> Dict[str, List[torch.Tensor]]:
         return {
@@ -176,6 +195,69 @@ class HiaQwenJointModel(nn.Module):
         hia_features: HiaFeatureOutput,
     ) -> Any:
         return self.llm(**self.merged_inputs(prompts, hia_features, targets))
+
+    def aux_regression_losses(
+        self,
+        projected: Dict[str, List[torch.Tensor]],
+        phone_targets: Sequence[torch.Tensor],
+        word_targets: Sequence[torch.Tensor],
+    ) -> Dict[str, torch.Tensor]:
+        """Per-row MSE of the regression heads vs gold scores (normalized to [0,1]).
+
+        `projected["phone"][r]` is [T_phn, llm_dim] aligned (verified) to the
+        flattened word-order gold phones; `projected["word"][r]` is [T_wrd, llm_dim]
+        aligned to labels["words"].
+        """
+        device = next(self.projectors.parameters()).device
+        if next(self.phone_reg_head.parameters()).device != device:
+            self.phone_reg_head.to(device)
+            self.word_reg_head.to(device)
+        phone_terms: List[torch.Tensor] = []
+        for feat, tgt in zip(projected["phone"], phone_targets):
+            if feat.shape[0] == 0 or tgt.numel() == 0:
+                continue
+            pred = self.phone_reg_head(feat).squeeze(-1)
+            phone_terms.append(F.mse_loss(pred, tgt.to(device).float() / 10.0))
+        word_terms: List[torch.Tensor] = []
+        for feat, tgt in zip(projected["word"], word_targets):
+            if feat.shape[0] == 0 or tgt.numel() == 0:
+                continue
+            pred = self.word_reg_head(feat)
+            word_terms.append(F.mse_loss(pred, tgt.to(device).float() / 10.0))
+        zero = torch.zeros((), device=device)
+        return {
+            "phone_mse": torch.stack(phone_terms).mean() if phone_terms else zero,
+            "word_mse": torch.stack(word_terms).mean() if word_terms else zero,
+        }
+
+    def forward_multitask(
+        self,
+        prompts: Sequence[str],
+        targets: Sequence[str],
+        hia_features: HiaFeatureOutput,
+        phone_targets: Sequence[torch.Tensor],
+        word_targets: Sequence[torch.Tensor],
+        aux_phone_weight: float = 1.0,
+        aux_word_weight: float = 1.0,
+    ) -> Dict[str, torch.Tensor]:
+        """LM loss + auxiliary phone/word regression on the projected soft tokens."""
+        device = next(self.projectors.parameters()).device
+        projected = self.projected_features(hia_features, device)
+        tokenized = tokenize_with_labels(self.tokenizer, prompts, targets)
+        tokenized = {k: v.to(device) for k, v in tokenized.items()}
+        embeds = _get_text_embedding_layer(self.llm)(tokenized["input_ids"])
+        merged = merge_hia_soft_tokens(
+            input_ids=tokenized["input_ids"],
+            attention_mask=tokenized["attention_mask"],
+            labels=tokenized["labels"],
+            token_embeds=embeds,
+            special_token_ids=self.special_token_ids,
+            projected=projected,
+        )
+        lm_loss = self.llm(**merged).loss
+        aux = self.aux_regression_losses(projected, phone_targets, word_targets)
+        total = lm_loss + aux_phone_weight * aux["phone_mse"] + aux_word_weight * aux["word_mse"]
+        return {"loss": total, "lm_loss": lm_loss, "phone_mse": aux["phone_mse"], "word_mse": aux["word_mse"]}
 
     @torch.no_grad()
     def generate_json(
@@ -390,6 +472,8 @@ class HiaQwenJointModel(nn.Module):
             {
                 "projectors": self.projectors.state_dict(),
                 "special_token_ids": self.special_token_ids,
+                "phone_reg_head": self.phone_reg_head.state_dict(),
+                "word_reg_head": self.word_reg_head.state_dict(),
             },
             output / "projector.pt",
         )
