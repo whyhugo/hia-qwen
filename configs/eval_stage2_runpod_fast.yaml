@@ -28,9 +28,10 @@ eval:
   checkpoint: outputs/joint_lora_stage2_multi
   out_dir: outputs/joint_lora_stage2_multi/eval_test
   max_records:
-  # Batched left-padded generation. The eval script runs a padding self-check
-  # on the first batch and aborts if batched != per-row output. A100 80GB has
-  # plenty of headroom; bump to 32 if you want it even faster.
-  batch_size: 16
+  # Batched left-padded generation + length-bucketing (records sorted by phone
+  # count so each batch is uniform length — avoids wasting generation on the
+  # longest row of a ragged batch). Longest batch runs first (fail-fast on OOM).
+  # 24 keeps the KV cache safely under 80GB; the script self-checks correctness.
+  batch_size: 24
   max_new_tokens: 1536
   num_workers: 0

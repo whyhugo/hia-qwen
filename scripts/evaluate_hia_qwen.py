@@ -116,17 +116,23 @@ def generate_predictions(cfg: Dict[str, Any], dataset: Stage2JsonDataset, max_ne
     model.projectors.to(device)
     model.eval()
     batch_size = int(eval_cfg.get("batch_size", 1))
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=int(eval_cfg.get("num_workers", 0)),
-        collate_fn=collate_stage2_batch,
-    )
     total = len(dataset)
+
+    # Length-bucketing: greedy decode runs each batch until its LONGEST row
+    # finishes, so mixing short and long utterances wastes huge amounts of
+    # generation on padding. Sort by phone count (longest first) so batches are
+    # length-homogeneous; the longest batch also runs first, failing fast on OOM.
+    # Order is irrelevant downstream — scoring looks predictions up by id.
+    def _phone_count(record: Dict[str, Any]) -> int:
+        return sum(len(word["phones"]) for word in record["labels"]["words"])
+
+    order = sorted(range(len(dataset)), key=lambda i: _phone_count(dataset.records[i]), reverse=True)
+
     predictions: List[Dict[str, str]] = []
     checked = batch_size <= 1  # only need the padding self-check when batching
-    for batch in loader:
+    for start in range(0, len(order), batch_size):
+        idx = order[start : start + batch_size]
+        batch = collate_stage2_batch([dataset[i] for i in idx])
         features = hia(batch.gop.to(device), batch.phn_id.to(device), batch.word_id.to(device))
         # Correctness gate: on the first multi-row batch, verify that the
         # left-padded batched decode matches a per-row (no-padding) decode.
