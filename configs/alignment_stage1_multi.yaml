@@ -1,0 +1,39 @@
+seed: 17
+output_dir: outputs/alignment_stage1_multi
+max_train_records:
+min_free_vram_gb: 22
+
+data:
+  # Multi-granularity alignment: supervise sentence + word + phone scores so the
+  # phone/word projectors receive level-specific gradient (addresses the
+  # phone/word alignment bottleneck identified in docs/REPORT.md).
+  task: multi_all
+  train_jsonl: /datas/store163/whyhugo/ms-qwen2-reproduce/data/processed/so762/train_multi_all.jsonl
+  seq_data_dir: /datas/store163/whyhugo/apa-hia-framework/data/seq_data_librispeech
+  raw_data_root: /datas/store163/whyhugo/datasets/speechocean762
+
+hia:
+  repo: /datas/store163/whyhugo/apa-hia-framework
+  checkpoint: /datas/store163/whyhugo/apa-hia-framework/exp/hia_seed17/models/best_audio_model.pth
+  embed_dim: 48
+  num_heads: 1
+  depth: 3
+  dropout: 0.1
+  seq_len: 50
+
+qwen:
+  base_model: Qwen/Qwen2-Audio-7B-Instruct
+  local_files_only: true
+  torch_dtype: bfloat16
+  device_map: auto
+  quantization: 4bit
+  projector_hidden_dim:
+  projector_dropout: 0.0
+
+train:
+  num_epochs: 1
+  batch_size: 1
+  gradient_accumulation_steps: 1
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  num_workers: 0

@@ -249,11 +249,19 @@ def main() -> None:
     projector_checkpoint = qwen_cfg.get("projector_checkpoint")
     if projector_checkpoint:
         path = Path(projector_checkpoint)
-        if path.exists():
-            model.load_projectors(path, strict=True)
-            print(f"Loaded stage-1 projectors from {path}")
-        else:
-            print(f"Projector checkpoint not found; starting projectors from scratch: {path}")
+        if not path.exists():
+            # Fail loudly: a configured-but-missing checkpoint almost always means
+            # the Stage-1 run crashed before saving. Silently falling back to
+            # random projectors invalidates the experiment (see the multi run that
+            # trained projectors from scratch because Stage 1 died at step 974).
+            raise SystemExit(
+                f"Configured projector checkpoint does not exist: {path}\n"
+                "Stage 1 likely did not finish and never saved projector.pt. "
+                "Re-run Stage 1 to completion, or remove qwen.projector_checkpoint "
+                "from the config to intentionally start projectors from scratch."
+            )
+        model.load_projectors(path, strict=True)
+        print(f"Loaded stage-1 projectors from {path}")
     else:
         print("No projector checkpoint configured; starting projectors from scratch.")
 

@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 from hia_qwen.data import AlignmentDataset, collate_alignment_batch
+from hia_qwen.stage2_data import Stage2JsonDataset, collate_stage2_batch
 from hia_qwen.hia_features import HiaFeatureExtractor
 from hia_qwen.modeling import HiaQwenAlignmentModel
 
@@ -148,21 +149,45 @@ def main() -> None:
         print(f"[exp] tb_dir:   runs/{exp_name}")
 
     max_records = cfg.get("max_train_records")
-    dataset = AlignmentDataset(
-        jsonl_path=data_cfg["train_jsonl"],
-        seq_data_dir=data_cfg["seq_data_dir"],
-        raw_data_root=data_cfg["raw_data_root"],
-        split="train",
-        max_records=int(max_records) if max_records else None,
-    )
+    # Stage-1 alignment objective is selectable via data.task:
+    #   - "sentence_total" (default): legacy single-signal alignment; projectors
+    #     only ever receive gradient about the sentence-level total, so the
+    #     phone/word projectors are never directly supervised.
+    #   - "multi_all": multi-granularity alignment using the full JSON target
+    #     (sentence + per-word + per-phone scores). This forces the phone/word
+    #     soft tokens to carry level-specific information, addressing the
+    #     phone/word alignment bottleneck.
+    task = str(data_cfg.get("task", "sentence_total"))
+    if task == "multi_all":
+        dataset = Stage2JsonDataset(
+            jsonl_path=data_cfg["train_jsonl"],
+            seq_data_dir=data_cfg["seq_data_dir"],
+            raw_data_root=data_cfg["raw_data_root"],
+            split="train",
+            task="multi_all",
+            max_records=int(max_records) if max_records else None,
+            use_hia=True,
+        )
+        collate_fn = collate_stage2_batch
+    elif task == "sentence_total":
+        dataset = AlignmentDataset(
+            jsonl_path=data_cfg["train_jsonl"],
+            seq_data_dir=data_cfg["seq_data_dir"],
+            raw_data_root=data_cfg["raw_data_root"],
+            split="train",
+            max_records=int(max_records) if max_records else None,
+        )
+        collate_fn = collate_alignment_batch
+    else:
+        raise SystemExit(f"Unsupported data.task for stage 1: {task!r}")
     dataloader = DataLoader(
         dataset,
         batch_size=int(train_cfg.get("batch_size", 1)),
         shuffle=not args.dry_run,
         num_workers=int(train_cfg.get("num_workers", 0)),
-        collate_fn=collate_alignment_batch,
+        collate_fn=collate_fn,
     )
-    print(f"Loaded {len(dataset)} aligned sentence_total records.")
+    print(f"Loaded {len(dataset)} aligned '{task}' records.")
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     hia = HiaFeatureExtractor(
