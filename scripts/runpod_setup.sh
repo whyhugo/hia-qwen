@@ -17,9 +17,13 @@ echo "=== [2/4] Install requirements ==="
 python -m pip install -r requirements.txt
 
 echo "=== [3/4] Pre-download Qwen2-Audio-7B-Instruct to HF cache (on the volume) ==="
+# Use the Python API (version-robust). Do NOT `pip install -U huggingface_hub` —
+# that can pull hub 1.x, which transformers<5 rejects and which renames the CLI.
 export HF_HOME="${HF_HOME:-$REPO_DIR/.hf_cache}"
-python -m pip install -U "huggingface_hub[cli]"
-huggingface-cli download Qwen/Qwen2-Audio-7B-Instruct --quiet
+python - <<'PY'
+from huggingface_hub import snapshot_download
+print("downloaded to:", snapshot_download("Qwen/Qwen2-Audio-7B-Instruct"))
+PY
 echo "HF_HOME=$HF_HOME  (export this in the GPU pod too)"
 
 echo "=== [4/4] Sanity: bundled data + HIA code load ==="

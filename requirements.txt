@@ -11,3 +11,6 @@ scipy>=1.10
 tqdm>=4.66
 tensorboard>=2.13
 safetensors>=0.4
+# transformers<5 needs hub<1.0; pin to avoid an accidental hub 1.x upgrade
+# (hub 1.x also renames the `huggingface-cli` command to `hf`).
+huggingface-hub>=0.34.0,<1.0
