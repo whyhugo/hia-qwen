@@ -9,18 +9,25 @@
 [![Dataset](https://img.shields.io/badge/dataset-SpeechOcean762-2F855A)](https://www.openslr.org/101/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
+**Fusing Hierarchical Interactive Attention Features into Large Language Models for Automatic Pronunciation Assessment**
+（融合階層式互動注意力特徵之大型語言模型發音評估）— NTNU CSIE undergraduate project, 2026.
+
 This repository implements a two-stage experiment that fuses the HIA pronunciation-assessment frontend with a Qwen2-Audio language backend through learnable soft prompts.
 
-The experiment does not feed raw audio into Qwen. HIA reads GOP features and phone ids, then its hidden states are projected into Qwen's embedding space and injected as continuous soft tokens.
+The experiment does not feed raw audio into Qwen. HIA reads GOP features and phone ids, then its hidden states are projected into Qwen's embedding space and injected as continuous soft tokens — Qwen's own audio encoder is bypassed entirely, so every acoustic cue the model sees arrives through the HIA soft prompt.
 
 ## Architecture
 
 ```text
-GOP + phone ids -> frozen HIA -> HIA hidden states
+GOP + phone ids -> frozen HIA -> HIA hidden states (phone / word / utterance)
                                 -> projector MLPs -> Qwen embedding space
-text prompt + HIA soft tokens   -> Qwen2-Audio decoder
-                                -> APA scores
+text prompt + HIA soft tokens   -> Qwen2-Audio decoder (frozen, 4-bit) + LoRA
+                                -> multi-level JSON scores
 ```
+
+The prompt reserves three placeholder tokens — `<|hia_utt|>`, `<|hia_word|>`, `<|hia_phone|>`. At the embedding layer their word embeddings are replaced in place by the projected acoustic vectors, and the resulting mixed text/acoustic sequence is fed to Qwen as `inputs_embeds`.
+
+Each granularity gets its own (unshared) two-layer projector, `Linear(48 -> 4096) -> GELU -> Linear(4096 -> 4096)`; the hidden width follows `qwen.projector_hidden_dim` and defaults to the LLM dimension.
 
 | Stage | Objective | Trainable | Frozen | Target |
 | --- | --- | --- | --- | --- |
@@ -44,6 +51,40 @@ Feature streams:
 - Phone: valid positions from `F_phn [B,L,D]` -> `[B,T_phn,D]`
 - Word: pooled Word Branch `F_word [B,L,D]` -> `[B,T_wrd,D]`
 - Utterance: utterance branch `dec_out [B,1,D]`
+
+## Results
+
+SpeechOcean762 official split, 2,500 test utterances. Qwen2-Audio-7B-Instruct loaded in 4-bit with bf16 compute; HIA `embed_dim=48`, `depth=3`, `heads=1`, seed 17; LR `1e-4`, LoRA `r=8`, `alpha=16`, batch size 1, 6 epochs (Stage 2 resumed from the epoch-3 checkpoint).
+
+| Level | Aspect | PCC | SCC | RMSE |
+| --- | --- | --- | --- | --- |
+| sentence | total | 0.658 | 0.604 | 1.350 |
+| sentence | accuracy | 0.632 | 0.602 | 1.301 |
+| sentence | fluency | 0.676 | 0.611 | 1.087 |
+| sentence | prosody | 0.667 | 0.595 | 1.153 |
+| word | accuracy | 0.386 | 0.349 | 1.822 |
+| word | total | 0.398 | 0.352 | 1.586 |
+| phone | accuracy | 0.368 | 0.312 | 1.982 |
+
+Three-way PCC comparison (all 6 epochs, same test set and 4-bit setting). *No-HIA* is the ablation above; *baseline* is the raw-audio Qwen2-Audio LoRA fine-tune of Microsoft (arXiv:2509.15701), reproduced locally:
+
+| Level | Aspect | No-HIA | HIA-Qwen | Raw-audio baseline |
+| --- | --- | --- | --- | --- |
+| sentence | total | 0.233 | 0.658 | 0.768 |
+| sentence | fluency | 0.236 | **0.676** | 0.670 |
+| sentence | prosody | 0.219 | 0.667 | 0.680 |
+| sentence | accuracy | 0.236 | 0.632 | 0.744 |
+| word | accuracy | 0.143 | 0.386 | 0.601 |
+| phone | accuracy | 0.124 | 0.368 | 0.544 |
+
+![Ablation PCC comparison](figures/fig1_ablation_pcc_comparison.png)
+
+Takeaways:
+
+- **HIA carries the scoring ability.** Removing the soft prompts costs 0.24–0.45 PCC; without them the model can only guess from the reference-text prior.
+- **Sentence level matches the raw-audio baseline.** Fluency slightly exceeds it (0.676 vs 0.670) and prosody is within 0.014.
+- **Phone/word still trail by ~0.18–0.22.** This looks like a feature-transfer bottleneck (Stage-1 alignment supervised only by the sentence total, 48-dim features, GOP-derived rather than waveform input) rather than a limitation of the fusion architecture. The `multi_all` Stage-1 task and the auxiliary regression heads below are the direct fixes for the first of those.
+- **JSON validity is 98.4%** (40 of 2,500 unparsable); the residual failures are mostly an off-by-one phone count, inconsistent word casing, or stray leading whitespace.
 
 ## Repository Layout
 
@@ -276,7 +317,8 @@ Metrics include PCC, SCC, RMSE, and invalid JSON count.
 python scripts/make_poster_figures.py
 ```
 
-![Ablation PCC comparison](figures/fig1_ablation_pcc_comparison.png)
+- `figures/fig1_ablation_pcc_comparison.*` — the three-way PCC chart shown under [Results](#results).
+- `figures/fig2_architecture.*` — the system architecture diagram shown above.
 
 Note: the baseline metrics path in that script points at the original development machine, so update `BASE_METRICS` before regenerating elsewhere.
 
@@ -294,6 +336,27 @@ python scripts/train_joint_lora.py --config configs/joint_lora_stage2.yaml --dry
 python scripts/train_joint_lora.py --config configs/joint_lora_stage2.yaml
 python scripts/evaluate_hia_qwen.py --config configs/eval_stage2.yaml
 ```
+
+## Known Limitations and Next Steps
+
+Taken from the project report's analysis, in the order they are worth attacking:
+
+1. **Multi-granularity Stage-1 alignment.** The original run supervised Stage 1 with the sentence total only, so the phone/word projectors never received a level-specific signal. `configs/alignment_stage1_multi.yaml` (task `multi_all`) and the Stage-2 auxiliary regression heads implement this fix; the numbers in [Results](#results) predate it.
+2. **Acoustic information capacity.** HIA's 48-dim features may simply be too narrow at the phone level. Options: widen `hia.embed_dim`, or read a higher-dimensional intermediate HIA layer.
+3. **Hyperparameter search.** 6 epochs is enough for the sentence level; a small sweep over LoRA rank and learning rate would rule out an under-tuned baseline.
+4. **Lenient output parsing.** Normalizing case and stripping stray whitespace before parsing should push the 1.6% invalid rate lower.
+
+## References
+
+The two primary references are bundled under `papers/`.
+
+1. H. Han, H.-C. Pei, Z.-Z. Nie, X. Luo, X.-S. Xu. *Multi-granularity Interactive Attention Framework for Residual Hierarchical Pronunciation Assessment.* AAAI 2026. — the HIA frontend used here (external work; this repo does not propose it).
+2. *Fine-Tuning Large Multimodal Models for Automatic Pronunciation Assessment.* arXiv:2509.15701, 2025. — the raw-audio baseline.
+3. J. Zhang et al. *SpeechOcean762: An Open-Source Non-native English Speech Corpus for Pronunciation Assessment.* Interspeech 2021.
+4. Y. Chu et al. *Qwen2-Audio Technical Report.* arXiv:2407.10759, 2024.
+5. E. J. Hu et al. *LoRA: Low-Rank Adaptation of Large Language Models.* ICLR 2022.
+6. T. Ahn, H. Nam. *English Pronunciation Evaluation without Complex Joint Training: LoRA Fine-tuned Speech Multimodal LLM.* arXiv:2509.02915, 2025.
+7. S. M. Witt, S. J. Young. *Phone-level pronunciation scoring and assessment for interactive language learning.* Speech Communication 30(2-3), 2000. — GOP.
 
 ## License
 
